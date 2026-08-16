@@ -48,7 +48,11 @@ Hoje, agendar tarefas recorrentes exige `cron` (Linux/macOS) ou Task Scheduler (
 | Parada do daemon | ✅ Via mensagem de "shutdown" pelo próprio canal IPC (não via sinal de SO) | Sinais não existem de forma equivalente no Windows; usar o mesmo canal que já existe evita reimplementar sinalização por SO. |
 | Suporte a horário fixo | ✅ Sim, estilo **cron completo** (minuto, hora, dia do mês, mês, dia da semana) | Cobre casos como "todo dia às 12h" e "toda segunda às 9h", não só hora do dia isolada. |
 | Diferenciação na CLI | ✅ Flag nova `--at "<expressão cron>"`. O argumento posicional de intervalo continua existindo e significa só intervalo. | Evita ambiguidade entre `12:00:00` como intervalo e como horário — cada sintaxe tem seu próprio parâmetro. |
-| Modelo de dados | ✅ Generalizado desde o Módulo 1: `Task` passa a ter um campo `Gatilho` (struct própria), em vez de `Intervalo` direto. | Intervalo e horário fixo calculam "próxima execução" de formas totalmente diferentes — melhor já nascer com essa separação do que refatorar depois. |
+| Modelo de dados | ✅ Generalizado desde o Módulo 1: `Task` passa a ter um campo `Trigger` (struct própria), em vez de `Interval` direto. | Intervalo e horário fixo calculam "próxima execução" de formas totalmente diferentes — melhor já nascer com essa separação do que refatorar depois. |
+| Nomenclatura do código | ✅ Nomes de tipo/campo em **inglês** (`Task`, `ActionType`, `Trigger`, `NextRunning`...), comentários e este guia continuam em **português**. | Consistência com a convenção idiomática de Go e com libs de terceiros (ex: tags `json:"..."`), mantendo o aprendizado documentado em PT-BR nos comentários — ver nota no Módulo 1. |
+| CLI | ✅ `cobra` (não parsing manual de `os.Args`) — já implementado (`cmd/root.go`, `cmd/task.go`, `cmd/task_add.go`). | Decisão do Módulo 3 antecipada; ensina o padrão real usado por CLIs Go do mercado. |
+| Persistência de tasks | ✅ `TaskManager` (`internal/task/task_manager.go`) — singleton via `GetInstance()`, escrita atômica (arquivo `.tmp` + `os.Rename`), protegida por `sync.RWMutex`. | Trouxe a segurança de concorrência planejada pro Módulo 5 já pro Módulo 1 — evita reescrever a camada de persistência mais tarde. |
+| Config centralizada | ✅ `internal/app.Config{TasksPath}` + `GetDsyncPath()` resolvem e criam `~/.dsync` automaticamente. | Um único lugar resolve onde tudo mora em disco (config e tasks), em vez de cada pacote calcular o caminho na mão. |
 | Parsing da expressão cron | ✅ Escrito à mão (não usar `robfig/cron`) — módulo dedicado (2b) | Decisão consciente de aprendizado: parsing de campos com `*`, listas, ranges e steps, mais o cálculo de "próximo instante válido", é um exercício rico por si só. |
 
 ---
@@ -59,11 +63,12 @@ Vamos decidir cada uma quando chegarmos no módulo correspondente — não preci
 
 1. **Destino da cópia** (tasks tipo "arquivo"): flag `--to <destino>` no `task add`, ou diretório padrão configurável (ex: `~/.dsync/copies/<nome>/`)? *(Módulo 3/4)*
 2. **"Código Go"**: aceita só caminho pra um arquivo `.go`, ou também um diretório/pacote? *(Módulo 4)*
-3. `CC` no formato longo do intervalo (`HHHH:MM:SS:CC`) = centésimos de segundo — confirmar. *(Módulo 2)*
+3. 🔸 **`internal/trigger.ConvertTime` hoje valida como horário de relógio (H 0–23, M/S 0–59, CC 0–99), não como duração livre.** Isso parece alimentar melhor o Módulo 2b (horário fixo) do que o 2a (intervalo, que na v0.1 previa `HHHH` até 9999h). Precisa decidir: o parser de intervalo continua sendo uma função separada (aceitando `HHHH` grande), ou o conceito de "intervalo" também vira um horário limitado a 24h? *(Módulo 2)*
 4. Task que falha repetidamente: continua tentando pra sempre ou desativa depois de N falhas? *(Módulo 5)*
 5. Versionamento de cópias de arquivo: sobrescreve sempre, ou mantém histórico? *(Módulo 4)*
 6. `task remove` de uma task em execução: espera terminar ou interrompe? *(Módulo 5)*
 7. Biblioteca de tray pra Go e estratégia de empacotamento por SO. *(Módulo 8)*
+8. `cmd/task_add.go` ainda não lê argumentos nem chama `TaskManager.Add` — é só um placeholder do `cobra`. Falta decidir a sintaxe final de flags antes de implementar de verdade. *(Módulo 3)*
 
 ---
 
@@ -83,85 +88,102 @@ go mod init dsync
 
 ---
 
-### Módulo 1 — Modelo de dados + persistência *(em andamento — struct atualizada, ver nota abaixo)*
+### Módulo 1 — Modelo de dados + persistência ✅ *(concluído — struct e persistência atualizadas, ver nota abaixo)*
 **Objetivo:** representar uma `Task` em memória e salvar/carregar em disco.
-**Entregável:**
+**Entregável real (`internal/task`):**
 ```go
-func SaveTasks(tasks []Task) error
-func LoadTasks() ([]Task, error)
+func NewTaskManager(path string) (*TaskManager, error)
+func GetInstance() (*TaskManager, error)          // singleton, resolve ~/.dsync/tasks.json
+func (tm *TaskManager) Add(t Task) error           // grava com lock + escrita atômica
+func (tm *TaskManager) List() []Task
 ```
-**Regras:**
-- Arquivo em `~/.dsync/tasks.json` (`os.UserHomeDir` + `os.MkdirAll`).
-- `SaveTasks` sobrescreve o arquivo inteiro (sem lock de concorrência ainda — isso vem no Módulo 5).
-- `LoadTasks` sem arquivo existente → lista vazia, sem erro.
-- Usar `json.MarshalIndent` para o arquivo ficar legível.
+**Regras implementadas:**
+- Arquivo em `~/.dsync/tasks.json`, resolvido por `app.GetDsyncPath()` (`os.UserHomeDir` + `os.MkdirAll`, ver `internal/app/Config.go`).
+- `Add`/`saveLocked` gravam em `tasks.json.tmp` e usam `os.Rename` pra escrita atômica — já protegido por `sync.RWMutex`, adiantado do Módulo 5.
+- Carregar sem arquivo existente → mapa vazio, sem erro (`os.IsNotExist`).
+- `json.MarshalIndent` pra deixar o arquivo legível.
 
-**Conceitos novos:** structs, structs aninhadas, tags de struct (`json:"..."`), ponteiros para valores opcionais (`*time.Time`), pacotes `os`, `encoding/json`, `path/filepath`, `time`.
+**Conceitos novos:** structs, structs aninhadas, tags de struct (`json:"..."`), ponteiros para valores opcionais (`*time.Time`), pacotes `os`, `encoding/json`, `path/filepath`, `time`, `sync.RWMutex`, `sync.Once` (usado no singleton `GetInstance`).
 
-**Struct atualizada** (agora com `Gatilho` separado, pra suportar intervalo e horário fixo/cron):
+**Struct real** (código em inglês; comentários no arquivo continuam em português):
 ```go
-type TipoAcao string
+type ActionType string
 
 const (
-	AcaoComando TipoAcao = "comando"
-	AcaoArquivo TipoAcao = "arquivo"
-	AcaoGoCode  TipoAcao = "go"
+	ActionCommand ActionType = "command"
+	ActionFile    ActionType = "file"
+	ActionGo      ActionType = "go"
 )
 
-type TipoGatilho string
+type TriggerType string
 
 const (
-	GatilhoIntervalo   TipoGatilho = "intervalo"
-	GatilhoHorarioFixo TipoGatilho = "horario_fixo" // estilo cron
+	TriggerInterval TriggerType = "interval"
+	TriggerFixed    TriggerType = "fixed_time"
 )
 
-// Gatilho decide QUANDO a task dispara. Só um dos dois campos de valor
-// é preenchido, dependendo de Tipo — isso fica mais robusto ainda no
-// Módulo 2, quando os dois viram tipos totalmente distintos.
-type Gatilho struct {
-	Tipo      TipoGatilho   `json:"tipo"`
-	Intervalo time.Duration `json:"intervalo,omitempty"` // usado se Tipo == intervalo
-	CronExpr  string        `json:"cron_expr,omitempty"` // usado se Tipo == horario_fixo, ex: "0 12 * * *"
+// Trigger decide QUANDO a task dispara. Só um dos dois campos de valor
+// é preenchido, dependendo de Type.
+type Trigger struct {
+	Type     TriggerType   `json:"type"`
+	Interval time.Duration `json:"interval,omitempty"` // usado se Type == interval
+	CronExpr string        `json:"cron_expr,omitempty"` // usado se Type == fixed_time, ex: "0 12 * * *"
 }
 
 type Task struct {
-	Nome            string     `json:"nome"`
-	TipoAcao        TipoAcao   `json:"tipo_acao"`
-	Payload         string     `json:"payload"`
-	Destino         string     `json:"destino,omitempty"`
-	Gatilho         Gatilho    `json:"gatilho"`
-	ProximaExecucao time.Time  `json:"proxima_execucao"`
-	UltimaExecucao  *time.Time `json:"ultima_execucao,omitempty"`
-	Status          string     `json:"status"`
-	CriadaEm        time.Time  `json:"criada_em"`
+	Name        string     `json:"name"`
+	ActionType  ActionType `json:"action_type"`
+	Payload     string     `json:"payload"`
+	Destination string     `json:"destination,omitempty"`
+	Trigger     Trigger    `json:"trigger"`
+	NextRunning time.Time  `json:"next_running"`
+	LastRunning *time.Time `json:"last_running,omitempty"`
+	Status      string     `json:"status"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 ```
 
-**O que mudou em relação à primeira versão:**
-- O antigo campo `Tipo TaskType` (comando/arquivo/go) virou `TipoAcao`, pra não confundir com o novo `TipoGatilho` (intervalo/horário fixo) — dois conceitos diferentes, dois nomes diferentes.
-- `Intervalo time.Duration` saiu direto da `Task` e entrou dentro da nova struct `Gatilho`, junto com `CronExpr`. Isso é um exemplo de **struct aninhada** (uma struct como campo de outra) — comum em Go pra agrupar dados relacionados.
-- 🔸 **Se você já tinha escrito `SaveTasks`/`LoadTasks` com a struct antiga**, o código em si não muda muito (continua sendo só `json.MarshalIndent`/`json.Unmarshal` num `[]Task`) — só ajuste os nomes de campo na hora de montar uma `Task` de teste.
+**O que mudou em relação à primeira versão do PRD:**
+- Todos os nomes de tipo/campo viraram inglês (`Nome`→`Name`, `TipoAcao`→`ActionType`, `Gatilho`→`Trigger`, `ProximaExecucao`→`NextRunning`, `UltimaExecucao`→`LastRunning`, `CriadaEm`→`CreatedAt`, `Destino`→`Destination`) — decisão fechada na seção 2. Os comentários no código-fonte continuam em português.
+- `SaveTasks`/`LoadTasks` como funções soltas (ideia original) foram substituídas por `TaskManager`, que já resolve concorrência e escrita atômica — ver `internal/task/task_manager.go`.
+- `Interval time.Duration` saiu direto da `Task` e entrou dentro da nova struct `Trigger`, junto com `CronExpr`. Isso é um exemplo de **struct aninhada** (uma struct como campo de outra) — comum em Go pra agrupar dados relacionados.
 
-**Nota para depois:** `time.Duration` serializa em JSON como número de nanossegundos (feio de ler). Corrigir isso exige `MarshalJSON`/`UnmarshalJSON` customizados — ótimo exercício de interfaces implícitas (ver seção 6.6), mas não é bloqueante agora.
+**Nota para depois:** `time.Duration` serializa em JSON como número de nanossegundos (feio de ler). Corrigir isso exige `MarshalJSON`/`UnmarshalJSON` customizados — ótimo exercício de interfaces implícitas (ver seção 5.6), mas não é bloqueante agora.
 
 ---
 
 ### Módulo 2 — Parsing de gatilhos: intervalo (2a) e cron (2b)
-Esse módulo cresceu — agora cobre os dois tipos de `Gatilho`. São dois sub-módulos independentes; dá pra fazer 2a e já seguir pro Módulo 3 antes de encarar o 2b, se preferir avançar e voltar depois.
+Esse módulo cresceu — agora cobre os dois tipos de `Trigger`. São dois sub-módulos independentes; dá pra fazer 2a e já seguir pro Módulo 3 antes de encarar o 2b, se preferir avançar e voltar depois.
 
-#### 2a — Parsing do intervalo
-**Objetivo:** converter `HH:MM:SS` e `HHHH:MM:SS:CC` em `time.Duration`, na mão (sem lib pronta).
-**Entregável:** `func ParseIntervalo(s string) (time.Duration, error)` + testes.
-**Regras de validação:**
+#### 2a — Parsing de horário 🔸 *(implementado, mas ver pendência #3 da seção 3)*
+**Entregável real:** `func ConvertTime(s string) (*clock.Time, error)` (`internal/trigger/trigger_time.go`, tipo `Time` em `internal/clock/time.go`).
 
-| Formato | Campos | Faixas |
-|---|---|---|
-| `HH:MM:SS` | horas:min:seg | HH 00–99, MM 00–59, SS 00–59 |
-| `HHHH:MM:SS:CC` | horas:min:seg:centésimos | HHHH 0000–9999, MM/SS 00–59, CC 00–99 |
+```go
+// internal/clock/time.go
+package clock
 
-**Conceitos novos:** `strings.Split`, `strconv.Atoi`, criação de `error` customizado (`errors.New`, `fmt.Errorf` com `%w`), **table-driven tests** com o pacote `testing`.
+type Time struct {
+	Hours        int8
+	Minutes      int8
+	Seconds      int8
+	CentiSeconds int8
+}
+```
 
-**Exemplo de teste table-driven** (padrão idiomático em Go, vale internalizar):
+Aceita `H:M:S` (3 partes) ou `H:M:S:CC` (4 partes), separadas por `:` — não exige zero à esquerda. Validação real:
+
+| Campo | Faixa aceita |
+|---|---|
+| Horas | 0–23 |
+| Minutos | 0–59 |
+| Segundos | 0–59 |
+| Centésimos (`CC`, opcional) | 0–99 |
+
+Isso é uma validação de **horário de relógio de 24h**, diferente da ideia original do PRD (intervalo/duração com `HHHH` até 9999h). Ver pendência #3 na seção 3 — hoje `ConvertTime` serve melhor de base pro Módulo 2b (horário fixo) do que pro 2a (intervalo) como descrito originalmente.
+
+**Conceitos novos usados:** `strings.Split`, `strconv.ParseInt`, criação de `error` customizado (`fmt.Errorf`), **table-driven tests** com o pacote `testing` — já implementado de verdade em `internal/trigger/trigger_time_test.go`.
+
+**Exemplo de teste table-driven** (mesmo padrão do arquivo real, versão didática):
 ```go
 func TestParseIntervalo(t *testing.T) {
 	casos := []struct {
@@ -185,7 +207,7 @@ func TestParseIntervalo(t *testing.T) {
 }
 ```
 
-#### 2b — Parsing da expressão cron (estilo cron completo, escrito à mão)
+#### 2b — Parsing da expressão cron (estilo cron completo, escrito à mão) 🔸 *(não iniciado)*
 **Objetivo:** dado `--at "0 12 * * *"`, entender a expressão e saber calcular o próximo instante que ela descreve a partir de agora.
 **Entregável:**
 ```go
@@ -231,23 +253,21 @@ type CronSchedule struct {
 
 ---
 
-### Módulo 3 — CLI
+### Módulo 3 — CLI 🔸 *(iniciado — esqueleto cobra existe, comandos ainda placeholder)*
 **Objetivo:** comandos `dsync task add|remove|ls|execute`.
-**Entregável:** binário `dsync` funcional, operando só sobre o arquivo local (ainda sem daemon — isso é intencional, testamos a lógica de dados isolada primeiro).
-**Conceitos novos:** parsing de argumentos (`os.Args` na mão, ou lib como `cobra`), formatação de tabela (`text/tabwriter`), detecção de tipo de ação (caminho existente vs `.go` vs comando).
+**Estado atual:** `cobra` já escolhido e em uso (decisão da seção 2). Existe `rootCmd` (`cmd/root.go`, `Use: "dsync"`) e `dsync task` (`cmd/task.go`), com subcomando `dsync task add` (`cmd/task_add.go`) — mas o `Run` de `task add` hoje só imprime `"taskAdd called"`, sem ler flags/args nem chamar `tasks.GetInstance().Add(...)`. Falta implementar de verdade.
+**Conceitos novos:** parsing de argumentos com `cobra` (flags, subcomandos, `PersistentFlags`), formatação de tabela (`text/tabwriter`, ainda não usado), detecção de tipo de ação (caminho existente vs `.go` vs comando).
 
-**Sintaxe do `add` com os dois tipos de gatilho:**
+**Sintaxe do `add` com os dois tipos de gatilho (alvo, ainda não implementado):**
 ```bash
 dsync task add "echo bom dia" 00:00:10                 # gatilho: intervalo
 dsync task add "backup.sh" --at "0 12 * * *"           # gatilho: horário fixo (cron)
 ```
 O argumento posicional de intervalo e a flag `--at` são **mutuamente exclusivos** — se os dois vierem juntos, é erro de validação (mensagem clara, não silenciosamente ignora um dos dois).
 
-**Decisão de design a discutir neste módulo:** usar `cobra` (mais "profissional", ensina padrão de CLIs Go do mundo real) ou implementar na mão com `os.Args` (mais didático pra entender o que uma lib como cobra abstrai). Podemos fazer os dois: primeiro na mão, depois migrar pra `cobra`.
-
 ---
 
-### Módulo 4 — Execução das ações
+### Módulo 4 — Execução das ações 🔸 *(não iniciado)*
 **Objetivo:** implementar de fato o que cada tipo de task faz.
 **Entregável:** `func Executar(t Task) error` cobrindo os 3 tipos.
 
@@ -261,19 +281,19 @@ O argumento posicional de intervalo e a flag `--at` são **mutuamente exclusivos
 
 ---
 
-### Módulo 5 — Scheduler (o coração concorrente)
+### Módulo 5 — Scheduler (o coração concorrente) 🔸 *(não iniciado — parte de concorrência já adiantada no Módulo 1)*
 **Objetivo:** processo que mantém timers rodando e dispara tasks nos intervalos certos.
 **Entregável:** loop de agendamento rodando em background dentro do daemon.
 **Conceitos novos — os mais "Go" do projeto:**
 - **goroutines** (`go func() {...}()`) — uma por task ativa, ou um loop central com `time.Ticker`.
 - **channels** — comunicação entre a goroutine do scheduler e o resto do programa (ex: canal de "task disparou", canal de "pare tudo").
-- **`sync.Mutex`** — proteger a lista de tasks contra leitura/escrita simultânea (CLI e tray podem mexer ao mesmo tempo).
+- **`sync.Mutex`** — já usado (via `sync.RWMutex`) no `TaskManager` do Módulo 1; aqui se estende pro loop do scheduler.
 - **graceful shutdown** — capturar `SIGINT`/`SIGTERM` (`os/signal`) e desligar limpo, salvando estado antes de sair.
 - Política de concorrência por task: se o intervalo disparar de novo enquanto a execução anterior ainda roda, **pula e loga aviso** (evita empilhar).
 
 ---
 
-### Módulo 6 — Daemon + IPC
+### Módulo 6 — Daemon + IPC 🔸 *(não iniciado)*
 **Objetivo:** processo `dsyncd` separado, e a CLI conversando com ele.
 **Entregável:** `dsync daemon start|stop|status` funcionando; `task add/remove/ls/execute` passam a falar com o daemon em vez de mexer direto no arquivo.
 **Conceitos novos:** unix socket (`net.Listen("unix", ...)`) no Linux/macOS, named pipe no Windows, ou HTTP local como alternativa mais simples (`net/http` num `127.0.0.1:porta`), serialização de mensagens (JSON de novo), PID file, checagem de processo vivo.
@@ -282,10 +302,10 @@ O argumento posicional de intervalo e a flag `--at` são **mutuamente exclusivos
 
 ---
 
-### Módulo 7 — Logs
+### Módulo 7 — Logs 🔸 *(não iniciado)*
 **Objetivo:** cada task grava histórico de execução.
 **Entregável:** `~/.dsync/logs/<nome>.log` com timestamps, stdout/stderr, código de saída.
-**Conceitos novos:** `log/slog` (stdlib, Go 1.21+), abrir arquivo em modo append (`os.OpenFile` com `os.O_APPEND`).
+**Conceitos novos:** `log/slog` (já usado hoje só pra log de console em `main.go`/`internal/app`; falta o modo arquivo), abrir arquivo em modo append (`os.OpenFile` com `os.O_APPEND`).
 
 ---
 
@@ -309,13 +329,13 @@ var s string  // ""
 var b bool    // false
 var t Task    // struct com todos os campos no zero value
 ```
-Isso importa pro DSync: por exemplo, o zero value de `time.Time` é `0001-01-01 00:00:00`, não "vazio" — por isso usamos `*time.Time` (ponteiro) quando queremos representar "ainda não aconteceu".
+Isso importa pro DSync: por exemplo, o zero value de `time.Time` é `0001-01-01 00:00:00`, não "vazio" — por isso usamos `*time.Time` (ponteiro) quando queremos representar "ainda não aconteceu" (`Task.LastRunning`).
 
 ### 5.2 Structs e métodos
 Struct é um tipo composto — agrupa campos relacionados (como o `Task`). Métodos são funções "presas" a um tipo, via **receiver**:
 ```go
 func (t Task) EstaAtrasada() bool {
-	return time.Now().After(t.ProximaExecucao)
+	return time.Now().After(t.NextRunning)
 }
 ```
 `(t Task)` é o receiver — dentro do método, `t` é uma cópia da task. Se o método precisa **modificar** a struct original, o receiver tem que ser um ponteiro:
@@ -333,12 +353,12 @@ var x int = 5
 p := &x       // p é *int, aponta pra x
 *p = 10       // agora x vale 10
 ```
-No DSync isso aparece em dois lugares principais: `*time.Time` para "opcional", e receivers de método (`*Task`) para mutação.
+No DSync isso aparece em dois lugares principais: `*time.Time` para "opcional" (`LastRunning`), e receivers de método (`*Task`) para mutação.
 
 ### 5.4 Slices, arrays e maps
 - **Array**: tamanho fixo, raramente usado direto.
-- **Slice**: array dinâmico — o que você vai usar sempre. `[]Task` é uma slice de tasks.
-- **Map**: dicionário chave→valor. Útil pra indexar tasks por nome: `map[string]Task`.
+- **Slice**: array dinâmico — o que você vai usar sempre. `[]Task` é uma slice de tasks (é o que `TaskManager.List()` retorna).
+- **Map**: dicionário chave→valor. É como o `TaskManager` indexa tasks por nome: `map[string]Task`.
 
 ```go
 var tasks []Task                    // slice vazia
@@ -352,10 +372,10 @@ t, existe := porNome["backup-diario"] // segundo valor: existe ou não
 ### 5.5 Tratamento de erro
 Go não tem exceptions. Funções que podem falhar retornam um `error` como último valor, e você checa explicitamente:
 ```go
-func LoadTasks() ([]Task, error) {
-	dados, err := os.ReadFile(caminho)
+func (tm *TaskManager) load() error {
+	dados, err := os.ReadFile(tm.path)
 	if err != nil {
-		return nil, fmt.Errorf("erro lendo tasks: %w", err)
+		return fmt.Errorf("erro lendo tasks: %w", err)
 	}
 	// ...
 }
@@ -388,39 +408,51 @@ msg := <-ch // bloqueia até chegar algo
 ```
 No Módulo 5, o scheduler provavelmente terá uma goroutine central com `time.Ticker`, e channels para sinalizar "pare" (shutdown) ou "task X disparou agora".
 
-### 5.8 sync.Mutex
-Quando múltiplas goroutines (ou o daemon + a CLI) podem ler/escrever a mesma coisa (a lista de tasks) ao mesmo tempo, é preciso proteger com um lock:
+### 5.8 sync.Mutex / sync.RWMutex
+Quando múltiplas goroutines (ou o daemon + a CLI) podem ler/escrever a mesma coisa (a lista de tasks) ao mesmo tempo, é preciso proteger com um lock. É exatamente o que `TaskManager` já faz hoje:
 ```go
-type Store struct {
-	mu    sync.Mutex
-	tasks []Task
+type TaskManager struct {
+	mu    sync.RWMutex
+	tasks map[string]Task
+	path  string
 }
 
-func (s *Store) Adicionar(t Task) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tasks = append(s.tasks, t)
+func (tm *TaskManager) Add(t Task) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.tasks[t.Name] = t
+	return tm.saveLocked()
 }
 ```
-`defer` executa a chamada no final da função, garantindo que o `Unlock` acontece mesmo se a função retornar mais cedo por erro.
+`RWMutex` permite várias leituras simultâneas (`RLock`, usado em `List()`), mas só uma escrita por vez (`Lock`, usado em `Add()`), e escrita bloqueia leitura. `defer` executa a chamada no final da função, garantindo que o `Unlock` acontece mesmo se a função retornar mais cedo por erro.
 
 ### 5.9 defer, panic, recover
 - `defer` adia uma chamada até o final da função (fecho de arquivo, unlock de mutex, etc.) — muito usado.
-- `panic`/`recover` são para erros irrecuperáveis/bugs, não para fluxo normal de erro (isso é `error`, como na seção 5.5). Você provavelmente vai usar pouco disso no DSync, exceto talvez pra evitar que uma task travando derrube o daemon inteiro.
+- `panic`/`recover` são para erros irrecuperáveis/bugs, não para fluxo normal de erro (isso é `error`, como na seção 5.5). Hoje o projeto usa `panic` em `internal/app.GetDsyncPath()` pra falhas de setup irrecuperáveis (`os.UserHomeDir` ou I/O real ao checar `~/.dsync`) — falha de configuração de ambiente não tem um jeito sensato de "continuar", então faz sentido parar cedo. Fora isso, é bom usar pouco, exceto talvez pra evitar que uma task travando derrube o daemon inteiro.
 
 ### 5.10 Pacotes e módulos
 - Um **módulo** (`go.mod`) é o projeto inteiro; pode conter vários **pacotes** (pastas com `.go` dentro).
 - `package main` é especial: é o ponto de entrada executável.
-- Convenção sugerida pro DSync conforme crescer:
+- **`internal/`** é um nome de diretório especial reconhecido pelo próprio compilador do Go: qualquer pacote dentro dele só pode ser importado por código do mesmo módulo (aqui, `github.com/Alangdp/dsync.git`) — é assim que o Go garante que "detalhe de implementação" não vaza pra quem importar o projeto de fora.
+
+**Estrutura atual do repositório:**
 ```
 dsync/
 ├── go.mod
-├── main.go              (CLI, package main)
-├── cmd/dsyncd/main.go    (daemon, outro package main)
-├── task/                 (package task: struct Task, parsing, persistência)
-├── scheduler/             (package scheduler)
-└── ipc/                   (package ipc)
+├── Makefile              (make build → dsync.exe)
+├── main.go               (entrypoint da CLI, package main)
+├── cmd/                   (package cmd — cobra: root, task, task add)
+│   ├── root.go
+│   ├── task.go
+│   └── task_add.go
+└── internal/
+    ├── app/                (Config, GetDsyncPath — resolve ~/.dsync)
+    ├── clock/               (Time: representação de horário HH:MM:SS:CC)
+    ├── filesystem/           (Exists)
+    ├── task/                  (Task, Trigger, TaskManager)
+    └── trigger/                (ConvertTime)
 ```
+Quando o Módulo 6 (daemon) for implementado, a convenção é `cmd/dsyncd/main.go` como segundo `package main` — ainda não existe.
 
 ### 5.11 os/exec — rodando processos externos
 ```go
@@ -438,7 +470,7 @@ cmd := exec.CommandContext(ctx, "sh", "-c", comandoLongo)
 Se o comando não terminar em 30s, o `ctx` cancela e mata o processo. Central pro Módulo 4 (timeout de execução de task).
 
 ### 5.13 Testes em Go
-Arquivo `*_test.go`, função `func TestAlgo(t *testing.T)`, roda com `go test ./...`. Padrão table-driven já mostrado na seção do Módulo 2 — vale adotar em todo o projeto, é o estilo idiomático de Go.
+Arquivo `*_test.go`, função `func TestAlgo(t *testing.T)`, roda com `go test ./...`. Padrão table-driven já mostrado na seção do Módulo 2 — vale adotar em todo o projeto, é o estilo idiomático de Go. Mensagens de falha de teste (`t.Errorf`, `t.Fatalf`) devem ficar em inglês, junto com o resto da saída do programa — só os comentários continuam em português.
 
 ### 5.14 Cross-platform (Linux/macOS/Windows no mesmo binário)
 - **Build tags / sufixo de arquivo**: `daemon_unix.go` vs `daemon_windows.go` — o compilador escolhe o arquivo certo pelo nome (`_windows.go`, `_linux.go`, `_darwin.go`) ou por diretiva `//go:build windows` no topo do arquivo.
@@ -447,35 +479,36 @@ Arquivo `*_test.go`, função `func TestAlgo(t *testing.T)`, roda com `go test .
 
 ---
 
-## 6. Referência rápida de pacotes stdlib usados no projeto
+## 6. Referência rápida de pacotes usados no projeto
 
 | Pacote | Pra que serve no DSync |
 |---|---|
 | `os` | home dir, args, arquivos, sinais |
-| `encoding/json` | serializar/desserializar tasks |
+| `encoding/json` | serializar/desserializar tasks e config |
 | `path/filepath` | montar caminhos multiplataforma |
 | `time` | duração, timestamps |
-| `strings`, `strconv` | parsing do intervalo |
+| `strings`, `strconv` | parsing de horário (`ConvertTime`) |
 | `errors`, `fmt` | erros customizados |
 | `testing` | testes |
-| `os/exec` | rodar comando/compilar Go |
-| `io` | cópia de arquivo |
-| `crypto/sha256` | hash do `.go` pra saber se recompila |
-| `context` | timeout de execução |
-| `sync` | proteger dados compartilhados |
-| `os/signal` | shutdown gracioso |
-| `net` / `net/http` | IPC CLI↔daemon |
-| `log/slog` | logging estruturado |
-| `text/tabwriter` | saída em tabela do `task ls` |
+| `sync` | `RWMutex`/`Once` — `TaskManager` e o singleton `GetInstance` |
+| `log/slog` | logging estruturado (já em uso em `main.go`/`internal/app`) |
+| `github.com/spf13/cobra` | parsing de comandos/flags da CLI (não é stdlib — dependência externa, ver Módulo 3) |
+| `os/exec` | rodar comando/compilar Go *(Módulo 4, ainda não usado)* |
+| `io` | cópia de arquivo *(Módulo 4, ainda não usado)* |
+| `crypto/sha256` | hash do `.go` pra saber se recompila *(Módulo 4, ainda não usado)* |
+| `context` | timeout de execução *(Módulo 4, ainda não usado)* |
+| `os/signal` | shutdown gracioso *(Módulo 5, ainda não usado)* |
+| `net` / `net/http` | IPC CLI↔daemon *(Módulo 6, ainda não usado)* |
+| `text/tabwriter` | saída em tabela do `task ls` *(Módulo 3, ainda não usado)* |
 
 ---
 
 ## 7. Próximos passos imediatos
 
-1. **Terminar Módulo 1** com a struct atualizada (`Gatilho` separado de `Task`): `SaveTasks`/`LoadTasks`.
-2. Escrever um `main.go` mínimo que cria uma `Task` com `Gatilho{Tipo: GatilhoIntervalo, ...}` na mão, salva, recarrega e imprime — validação manual antes de qualquer CLI de verdade.
-3. Seguir pro Módulo 2a (parsing de intervalo) com testes table-driven.
-4. Módulo 2b (parser de cron) pode vir logo depois ou ser intercalado com o Módulo 3 (CLI) — como preferir.
+1. ✅ Módulo 1 concluído: `Task`/`Trigger` em inglês, persistência via `TaskManager` com escrita atômica.
+2. 🔸 Resolver a pendência #3 da seção 3: decidir se `internal/trigger.ConvertTime`/`internal/clock.Time` é o parser do Módulo 2b (horário fixo) ou se o Módulo 2a (intervalo/duração) ainda precisa de uma função separada.
+3. Terminar o Módulo 3: fazer `cmd/task_add.go` de fato ler flags/args e chamar `tasks.GetInstance().Add(...)`, e implementar `task ls`/`task remove`.
+4. Módulo 2b (parser de cron) pode vir logo depois ou ser intercalado com o resto do Módulo 3 — como preferir.
 
 ---
 
